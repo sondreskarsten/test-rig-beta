@@ -1,0 +1,63 @@
+name: fetch-rig
+on:
+  workflow_dispatch:
+    inputs:
+      offset:
+        description: 'line offset into each shard file'
+        default: '0'
+      batch:
+        description: 'urls per shard this run'
+        default: '6000'
+jobs:
+  fetch:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch shard
+        env:
+          SHARD: ${{ matrix.shard }}
+          OFFSET: ${{ github.event.inputs.offset }}
+          BATCH: ${{ github.event.inputs.batch }}
+        run: |
+          python3 - <<'PY'
+          import os, json, time, urllib.request, hashlib, pathlib, re
+          from concurrent.futures import ThreadPoolExecutor
+          shard=int(os.environ["SHARD"]); offset=int(os.environ.get("OFFSET","0")); batch=int(os.environ.get("BATCH","6000"))
+          ip=urllib.request.urlopen("https://api.ipify.org",timeout=15).read().decode()
+          sf=pathlib.Path(f"urls/shard_{shard}.txt")
+          if not sf.exists(): print(f"no {sf}"); raise SystemExit(0)
+          lines=sf.read_text().splitlines()[offset:offset+batch]
+          print(f"shard {shard} ip={ip} offset={offset} n={len(lines)} CONC=16")
+          outdir=pathlib.Path(f"out/shard_{shard}"); outdir.mkdir(parents=True,exist_ok=True)
+          KIDRE=re.compile(rb'kid=\d+')
+          def fetch(line):
+              sv,url=line.split("\t",1); t0=time.time()
+              try: body=urllib.request.urlopen(url,timeout=25).read()
+              except Exception as e: return {"sv":sv,"verdict":"error","err":str(e)[:60],"ip":ip}
+              dt=round(time.time()-t0,3); size=len(body)
+              kidcount=len(KIDRE.findall(body))
+              # valid hent_nr page: has kid hrefs OR is a legit empty (orgnr exists but no announcements)
+              # error/shell pages have no kids AND error signature
+              is_err = b"Det har oppst" in body or b"igjen senere" in body
+              if is_err:
+                  return {"sv":sv,"verdict":"error_page","size":size,"ip":ip,"dt":dt}
+              if kidcount==0 and size<=26200:
+                  return {"sv":sv,"verdict":"shell","size":size,"ip":ip,"dt":dt}
+              (outdir/f"{sv}.html").write_bytes(body)
+              return {"sv":sv,"verdict":"ok","size":size,"kids":kidcount,"sha256":hashlib.sha256(body).hexdigest(),"ip":ip,"dt":dt}
+          with ThreadPoolExecutor(max_workers=16) as ex:
+              man=list(ex.map(fetch, lines))
+          ok=sum(1 for m in man if m['verdict']=='ok'); shell=sum(1 for m in man if m['verdict'] in('shell','error_page')); err=sum(1 for m in man if m['verdict']=='error')
+          (outdir/"_manifest.jsonl").write_text("\n".join(json.dumps(m) for m in man))
+          (outdir/"_meta.json").write_text(json.dumps({"shard":shard,"runner_ip":ip,"offset":offset,"processed":len(lines),"ok":ok,"shell":shell,"err":err}))
+          print(f"shard {shard} DONE ip={ip} ok={ok} shell={shell} err={err}")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fetch-shard-${{ matrix.shard }}
+          path: out/shard_${{ matrix.shard }}
+          retention-days: 90
